@@ -49,32 +49,39 @@ public class BlueOceanHook extends PluginCompatTesterHookBeforeCheckout {
     public Map<String, Object> action(Map<String, Object> moreInfo) throws Exception {
         PluginCompatTesterConfig config = (PluginCompatTesterConfig)moreInfo.get("config");
         Plugin currentPlugin = (Plugin)moreInfo.get("plugin");
+        // We should not execute the hook if using localCheckoutDir
+        boolean shouldExecuteHook = config.getLocalCheckoutDir() == null || !config.getLocalCheckoutDir().exists();
 
-        // Determine if we need to run the download; only run for first identified plugin in the series
-        if (firstRun) {
-            System.out.println("Preparing for Multimodule checkout.");
+        if (shouldExecuteHook) {
+            System.out.println("Executing Blue Ocean Hook");
+            // Determine if we need to run the download; only run for first identified plugin in the series
+            if (firstRun) {
+                System.out.println("Preparing for Multimodule checkout");
 
-            // Checkout to the parent directory. All other processes will be on the child directory
-            File parentPath = new File(config.workDirectory.getAbsolutePath()+"/"+parentName);
-            
-            System.out.println("Checking out from SCM connection URL : " + parentUrl + " ("+parentProjectName+"-"+currentPlugin.version+")");
-            ScmManager scmManager = SCMManagerFactory.getInstance().createScmManager();
-            ScmRepository repository = scmManager.makeScmRepository(parentUrl);
-            CheckOutScmResult result = scmManager.checkOut(repository, new ScmFileSet(parentPath), new ScmTag(parentProjectName+"-"+currentPlugin.version));
-            
-            if (!result.isSuccess()) {
-                // Throw an exception if there are any download errors.
-                throw new RuntimeException(result.getProviderMessage() + "||" + result.getCommandOutput());
-            } 
+                // Checkout to the parent directory. All other processes will be on the child directory
+                File parentPath = new File(config.workDirectory.getAbsolutePath() + "/" + parentName);
+
+                System.out.println("Checking out from SCM connection URL: " + parentUrl + " (" + parentProjectName + "-" + currentPlugin.version + ")");
+                ScmManager scmManager = SCMManagerFactory.getInstance().createScmManager();
+                ScmRepository repository = scmManager.makeScmRepository(parentUrl);
+                CheckOutScmResult result = scmManager.checkOut(repository, new ScmFileSet(parentPath), new ScmTag(parentProjectName + "-" + currentPlugin.version));
+
+                if (!result.isSuccess()) {
+                    // Throw an exception if there are any download errors.
+                    throw new RuntimeException(result.getProviderMessage() + "||" + result.getCommandOutput());
+                }
+            }
+
+            // Checkout already happened, don't run through again
+            moreInfo.put("runCheckout", false);
+            firstRun = false;
+
+            // Change the "download"" directory; after download, it's simply used for reference
+            File childPath = new File(config.workDirectory.getAbsolutePath() + "/" + parentName + "/" + currentPlugin.name);
+            System.out.println("Child path for " + currentPlugin.getDisplayName() + " " + childPath);
+            moreInfo.put("checkoutDir", childPath);
+            moreInfo.put("pluginDir", childPath);
         }
-
-        // Checkout already happened, don't run through again
-        moreInfo.put("runCheckout", false);
-        firstRun = false;
-
-        // Change the "download"" directory; after download, it's simply used for reference
-        File childPath = new File(config.workDirectory.getAbsolutePath()+"/"+parentName+"/"+currentPlugin.name);
-        moreInfo.put("checkoutDir", childPath);
 
         return moreInfo;
     }
