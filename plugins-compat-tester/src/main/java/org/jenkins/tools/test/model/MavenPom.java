@@ -140,9 +140,9 @@ public class MavenPom {
         writeDocument(pom, doc);
     }
 
-    public void addDependencies(Map<String,VersionNumber> toAdd, Map<String,VersionNumber> toReplace, Map<String,VersionNumber> toAddTest, Map<String,VersionNumber> toReplaceTest, VersionNumber coreDep, Map<String,String> pluginGroupIds, List<String> toConvert) 
-        throws IOException 
-    {
+    public void addDependencies(Map<String,VersionNumber> toAdd, Map<String,VersionNumber> toReplace,
+                                Map<String,VersionNumber> toAddTest, Map<String,VersionNumber> toReplaceTest,
+                                VersionNumber coreDep, Map<String,String> pluginGroupIds, List<String> toConvert) throws IOException {
         File pom = new File(rootDir.getAbsolutePath() + "/" + pomFileName);
         Document doc;
         try {
@@ -151,6 +151,7 @@ public class MavenPom {
             throw new IOException(x);
         }
         Element dependencies = doc.getRootElement().element("dependencies");
+        Element depenendecyManagement = doc.getRootElement().element("dependencyManagement");
         if (dependencies == null) {
             dependencies = doc.getRootElement().addElement("dependencies");
         }
@@ -173,15 +174,40 @@ public class MavenPom {
 
         Map<String,VersionNumber> toReplaceUsed = new LinkedHashMap<>();
         Map<String,VersionNumber> toReplaceTestUsed = new LinkedHashMap<>();
+
+        /* I have found issues with plugins defining a plugin dependency, let's call it `a`, in dependencyManagement section and a `tests` classified
+         * dependency in `test` scope for `a` to get some useful testing things. In those circumstances the version of `a` pulled in the final classpath for test scope is the one
+         * specified in the dependency management section, which until this change was not updated by the PCT. Resulting in errors. By updating dependencyManagement I fix the issue
+         *
+         * <dependencyManagement>
+         *   <dependency>
+         *     <artifactId>a</artifactId>
+         *     ..........................
+         *   </dependency>
+         * </dependencyManagement>
+         * <dependencies>
+         *   <dependency>
+         *     <artifactId>a</artifactId>
+         *     <classifier>tests</classifier>
+         *     <scope>test</scope>
+         *   </dependency>
+         * </dependencies>
+         *
+         */
+         for (Element mavenDependency: (List<Element>) depenendecyManagement.element("dependencies").elements("dependency")) {
+            Element artifactId = mavenDependency.element(ARTIFACT_ID_ELEMENT);
+            Element groupId = mavenDependency.element(GROUP_ID_ELEMENT);
+            System.out.println(String.format("Checking %s:%s in dependency management", groupId.getTextTrim(), artifactId.getTextTrim()));
+            String artifactIdTrimmed = artifactId.getTextTrim();
+            if(toReplaceTest.containsKey(artifactIdTrimmed)) {
+                mavenDependency.element("version").setText(toReplaceTest.get(artifactIdTrimmed).toString());
+            }
+        }
+
         for (Element mavenDependency : (List<Element>) dependencies.elements("dependency")) {
             Element artifactId = mavenDependency.element(ARTIFACT_ID_ELEMENT);
             Element groupId = mavenDependency.element(GROUP_ID_ELEMENT);
             if (artifactId == null || groupId == null) {
-                continue;
-            }
-
-            String expectedGroupId = pluginGroupIds.get(artifactId.getTextTrim());
-            if(expectedGroupId == null || !groupId.getTextTrim().equals(expectedGroupId)) {
                 continue;
             }
 
