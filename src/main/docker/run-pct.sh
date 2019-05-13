@@ -13,7 +13,7 @@ fi
 explodeWARIfNeeded() {
   if [ ! -f "${PCT_TMP}/exploded/war" ]; then
     mkdir -p "${PCT_TMP}/exploded/war"
-    unzip -q "${JENKINS_WAR_PATH}" -d "${PCT_TMP}/exploded/war"
+    unzip -o -q "${JENKINS_WAR_PATH}" -d "${PCT_TMP}/exploded/war"
   fi
 }
 
