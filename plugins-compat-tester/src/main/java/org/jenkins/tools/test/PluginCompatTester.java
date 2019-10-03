@@ -29,6 +29,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
 import hudson.AbortException;
 import hudson.Functions;
+import hudson.model.UpdateCenter;
 import hudson.model.UpdateSite;
 import hudson.model.UpdateSite.Plugin;
 import hudson.util.VersionNumber;
@@ -38,6 +39,7 @@ import io.jenkins.lib.versionnumber.JavaSpecificationVersion;
 import net.sf.json.JSONArray;
 import net.sf.json.JSONObject;
 import org.apache.commons.io.IOUtils;
+import org.apache.maven.model.Dependency;
 import org.apache.maven.scm.ScmException;
 import org.apache.maven.scm.ScmFileSet;
 import org.apache.maven.scm.ScmTag;
@@ -48,6 +50,7 @@ import org.codehaus.plexus.PlexusContainerException;
 import org.codehaus.plexus.component.repository.exception.ComponentLookupException;
 import org.codehaus.plexus.util.FileUtils;
 import org.codehaus.plexus.util.io.RawInputStreamFacade;
+import org.codehaus.plexus.util.xml.pull.XmlPullParserException;
 import org.jenkins.tools.test.exception.PluginSourcesUnavailableException;
 import org.jenkins.tools.test.exception.PomExecutionException;
 import org.jenkins.tools.test.model.*;
@@ -63,6 +66,7 @@ import javax.xml.transform.TransformerFactory;
 import javax.xml.transform.stream.StreamResult;
 import javax.xml.transform.stream.StreamSource;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileReader;
 import java.io.IOException;
@@ -143,7 +147,7 @@ public class PluginCompatTester {
     }
 
 	public PluginCompatReport testPlugins()
-        throws PlexusContainerException, IOException {
+            throws PlexusContainerException, IOException, PomExecutionException, XmlPullParserException {
         File war = config.getWar();
         if (war != null) {
             populateSplits(war);
@@ -169,10 +173,17 @@ public class PluginCompatTester {
 
         // Determine the plugin data
         HashMap<String,String> pluginGroupIds = new HashMap<>();  // Used to track real plugin groupIds from WARs
-        
+
+
         // Scan bundled plugins
         // If there is any bundled plugin, only these plugins will be taken under the consideration for the PCT run
-        UpdateSite.Data data = config.getWar() == null ? extractUpdateCenterData(pluginGroupIds) : scanWAR(config.getWar(), pluginGroupIds, "WEB-INF/(?:optional-)?plugins/([^/.]+)[.][hj]pi");        
+        UpdateSite.Data data = null;
+        if (config.getBom() != null) {
+            data = scanBom(pluginGroupIds, "([^/.]+)[.][hj]pi");
+        } else {
+            data = config.getWar() == null ? extractUpdateCenterData(pluginGroupIds) : scanWAR(config.getWar(), pluginGroupIds, "WEB-INF/(?:optional-)?plugins/([^/.]+)[.][hj]pi");
+        }
+
         if (!data.plugins.isEmpty()) {
             // Scan detached plugins to recover proper Group IDs for them
             // We always poll the update center so that we extract groupIDs for dependencies
@@ -184,9 +195,10 @@ public class PluginCompatTester {
 
 
             // Add detached if and only if no added as normal one
+            UpdateSite.Data finalData = data;
             detachedData.plugins.forEach((key, value) -> {
-                if (!data.plugins.containsKey(key)) {
-                    data.plugins.put(key, value);
+                if (!finalData.plugins.containsKey(key)) {
+                    finalData.plugins.put(key, value);
                 }
             });
         }
@@ -366,7 +378,7 @@ public class PluginCompatTester {
         return report;
 	}
 
-    private void generateHtmlReportFile() throws IOException {
+    void generateHtmlReportFile() throws IOException {
         if (!config.reportFile.exists() || !config.reportFile.isFile()) {
             throw new FileNotFoundException("Cannot find the XML report file: " + config.reportFile);
         }
@@ -603,6 +615,96 @@ public class PluginCompatTester {
 
         return site;
 	}
+
+    private UpdateSite.Data scanBom(HashMap<String, String> pluginGroupIds, String pluginRegExp) throws IOException, PomExecutionException, XmlPullParserException {
+        File fullDepPom = new MavenBom(config.getBom()).writeFullDepPom(config.workDirectory);
+
+        MavenRunner.Config mconfig = new MavenRunner.Config();
+        mconfig.userSettingsFile = config.getM2SettingsFile();
+        System.out.println(mconfig.userSettingsFile);
+        // TODO REMOVE
+        mconfig.userProperties.putAll(this.config.retrieveMavenProperties());
+
+        File buildLogFile = new File(config.workDirectory
+                + File.separator + "bom-download.log");
+        FileUtils.fileWrite(buildLogFile.getAbsolutePath(), ""); // Creating log file
+
+        runner.run(mconfig, fullDepPom.getParentFile(), buildLogFile, "dependency:copy-dependencies", "-P consume-incrementals", "-N");
+        JSONObject top = new JSONObject();
+        top.put("id", DEFAULT_SOURCE_ID);
+        JSONObject plugins = new JSONObject();
+            if (pluginGroupIds == null) {
+                pluginGroupIds = new HashMap<>();
+            }
+            List<File> entries = FileUtils.getFiles(new File(config.workDirectory, "bom" + File.separator + "target" + File.separator + "dependency"),null, null);
+            for (File entry : entries) {
+                String name = entry.getName();
+                Matcher m = Pattern.compile(JENKINS_CORE_FILE_REGEX).matcher(name);
+                if (m.matches()) {
+                    if (top.has("core")) {
+                        throw new IOException(">1 jenkins-core.jar found as dependency for bom file  " + config.getBom());
+                    }
+                    // http://foobar is used to workaround the check in https://github.com/jenkinsci/jenkins/commit/f8daafd0327081186c06555f225e84c420261b4c
+                    // We do not really care about the value
+                    top.put("core", new JSONObject().accumulate("name", "core").accumulate("version", m.group(1)).accumulate("url", "https://foobar"));
+                } else {
+                    m = Pattern.compile(pluginRegExp).matcher(name);
+                    try (InputStream is = new FileInputStream(entry); JarInputStream jis = new JarInputStream(is)) {
+                        Manifest manifest = jis.getManifest();
+                        if (manifest == null || manifest.getMainAttributes() == null) {
+                            // Skip this entry, is not a plugin and/or contains a malformed manifest so is not parseable
+                            System.out.println("Entry " + name + "defined in the BOM looks non parseable, ignoring");
+                            continue;
+                        }
+                        String jenkinsVersion = manifest.getMainAttributes().getValue("Jenkins-Version");
+                        String shortName = manifest.getMainAttributes().getValue("Short-Name");
+                        String groupId = manifest.getMainAttributes().getValue("Group-Id");
+                        String version = manifest.getMainAttributes().getValue("Plugin-Version");
+                        String dependencies = manifest.getMainAttributes().getValue("Plugin-Dependencies");
+                        // I expect BOMs to not specify hpi as type, which results in getting the jar artifact
+                        if (m.matches() || (jenkinsVersion != null && version != null)) { // I need a plugin version
+                            JSONObject plugin = new JSONObject().accumulate("url", "");
+                            if (shortName == null) {
+                                shortName = manifest.getMainAttributes().getValue("Extension-Name");
+                                if (shortName == null) {
+                                    shortName = m.group(1);
+                                }
+                            }
+                            plugin.put("name", shortName);
+                            pluginGroupIds.put(shortName, groupId);
+                            // Remove extra build information from the version number
+                            final Matcher matcher = Pattern.compile("^(.+-SNAPSHOT)(.+)$").matcher(version);
+                            if (matcher.matches()) {
+                                version = matcher.group(1);
+                            }
+                            plugin.put("version", version);
+                            plugin.put("url", entry.toURL());
+                            JSONArray dependenciesA = new JSONArray();
+                            if (dependencies != null) {
+                                // e.g. matrix-auth:1.0.2;resolution:=optional,credentials:1.8.3;resolution:=optional
+                                for (String pair : dependencies.split(",")) {
+                                    boolean optional = pair.endsWith("resolution:=optional");
+                                    String[] nameVer = pair.replace(";resolution:=optional", "").split(":");
+                                    assert nameVer.length == 2;
+                                    dependenciesA.add(new JSONObject().accumulate("name", nameVer[0]).accumulate("version", nameVer[1]).accumulate("optional", String.valueOf(optional)));
+                                }
+                            }
+                            plugin.accumulate("dependencies", dependenciesA);
+                            plugins.put(shortName, plugin);
+                        }
+                    }
+                }
+            }
+
+        top.put("plugins", plugins);
+        if (!top.has("core")) {
+            // Not all boms have the jenkins core dependency explicit, so, assume the bom version matches the jenkins version
+            String core = new MavenBom(config.getBom()).getModel().getVersion();
+            top.put("core", new JSONObject().accumulate("name", "core").accumulate("version",core).accumulate("url", "https://foobar"));
+        }
+        System.out.println("Readed contents of " + config.getBom() + ": " + top);
+        return newUpdateSiteData(new UpdateSite(DEFAULT_SOURCE_ID, null), top);
+    }
 
     /**
      * Scans through a WAR file, accumulating plugin information
